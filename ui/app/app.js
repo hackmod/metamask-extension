@@ -39,8 +39,7 @@ const Modal = require('./components/modals/index').Modal
 // Global Alert
 const Alert = require('./components/alert')
 
-const AppHeader = require('./components/app-header')
-
+import AppHeader from './components/app-header'
 import UnlockPage from './components/pages/unlock-page'
 
 // Routes
@@ -100,7 +99,7 @@ class App extends Component {
       network,
       isMouseUser,
       provider,
-      frequentRpcList,
+      frequentRpcListDetail,
       currentView,
       setMouseUserState,
     } = this.props
@@ -140,7 +139,7 @@ class App extends Component {
         // network dropdown
         h(NetworkDropdown, {
           provider,
-          frequentRpcList,
+          frequentRpcListDetail,
         }, []),
 
         h(AccountMenu),
@@ -229,6 +228,8 @@ class App extends Component {
       name = this.context.t('connectingToRopsten')
     } else if (providerName === 'rinkeby') {
       name = this.context.t('connectingToRinkeby')
+    } else if (providerName === 'classic') {
+      name = this.context.t('connectingToClassic')
     } else {
       name = this.context.t('connectingToUnknown')
     }
@@ -250,6 +251,8 @@ class App extends Component {
       name = this.context.t('kovan')
     } else if (providerName === 'rinkeby') {
       name = this.context.t('rinkeby')
+    } else if (providerName === 'classic') {
+      name = this.context.t('classic')
     } else {
       name = this.context.t('unknownNetwork')
     }
@@ -266,7 +269,7 @@ App.propTypes = {
   alertMessage: PropTypes.string,
   network: PropTypes.string,
   provider: PropTypes.object,
-  frequentRpcList: PropTypes.array,
+  frequentRpcListDetail: PropTypes.array,
   currentView: PropTypes.object,
   sidebarOpen: PropTypes.bool,
   alertOpen: PropTypes.bool,
@@ -358,7 +361,7 @@ function mapStateToProps (state) {
     forgottenPassword: state.appState.forgottenPassword,
     nextUnreadNotice,
     lostAccounts,
-    frequentRpcList: state.metamask.frequentRpcList || [],
+    frequentRpcListDetail: state.metamask.frequentRpcListDetail || [],
     currentCurrency: state.metamask.currentCurrency,
     isMouseUser: state.appState.isMouseUser,
     betaUI: state.metamask.featureFlags.betaUI,

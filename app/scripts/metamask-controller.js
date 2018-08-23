@@ -48,6 +48,8 @@ const percentile = require('percentile')
 const seedPhraseVerifier = require('./lib/seed-phrase-verifier')
 const log = require('loglevel')
 const TrezorKeyring = require('eth-trezor-keyring')
+const LedgerBridgeKeyring = require('eth-ledger-bridge-keyring')
+const EthQuery = require('eth-query')
 
 module.exports = class MetamaskController extends EventEmitter {
 
@@ -127,7 +129,7 @@ module.exports = class MetamaskController extends EventEmitter {
     })
 
     // key mgmt
-    const additionalKeyrings = [TrezorKeyring]
+    const additionalKeyrings = [TrezorKeyring, LedgerBridgeKeyring]
     this.keyringController = new KeyringController({
       keyringTypes: additionalKeyrings,
       initState: initState.KeyringController,
@@ -191,6 +193,8 @@ module.exports = class MetamaskController extends EventEmitter {
     })
     this.networkController.on('networkDidChange', () => {
       this.balancesController.updateAllBalances()
+      var currentCurrency = this.currencyController.getCurrentCurrency()
+      this.setCurrentCurrency(currentCurrency, function() {})
     })
     this.balancesController.updateAllBalances()
 
@@ -371,9 +375,7 @@ module.exports = class MetamaskController extends EventEmitter {
       connectHardware: nodeify(this.connectHardware, this),
       forgetDevice: nodeify(this.forgetDevice, this),
       checkHardwareStatus: nodeify(this.checkHardwareStatus, this),
-
-      // TREZOR
-      unlockTrezorAccount: nodeify(this.unlockTrezorAccount, this),
+      unlockHardwareWalletAccount: nodeify(this.unlockHardwareWalletAccount, this),
 
       // vault management
       submitPassword: nodeify(this.submitPassword, this),
@@ -475,12 +477,32 @@ module.exports = class MetamaskController extends EventEmitter {
   async createNewVaultAndRestore (password, seed) {
     const releaseLock = await this.createVaultMutex.acquire()
     try {
+      let accounts, lastBalance
+
+      const keyringController = this.keyringController
+
       // clear known identities
       this.preferencesController.setAddresses([])
       // create new vault
-      const vault = await this.keyringController.createNewVaultAndRestore(password, seed)
+      const vault = await keyringController.createNewVaultAndRestore(password, seed)
+
+      const ethQuery = new EthQuery(this.provider)
+      accounts = await keyringController.getAccounts()
+      lastBalance = await this.getBalance(accounts[accounts.length - 1], ethQuery)
+
+      const primaryKeyring = keyringController.getKeyringsByType('HD Key Tree')[0]
+      if (!primaryKeyring) {
+        throw new Error('MetamaskController - No HD Key Tree found')
+      }
+
+      // seek out the first zero balance
+      while (lastBalance !== '0x0') {
+        await keyringController.addNewAccount(primaryKeyring)
+        accounts = await keyringController.getAccounts()
+        lastBalance = await this.getBalance(accounts[accounts.length - 1], ethQuery)
+      }
+
       // set new identities
-      const accounts = await this.keyringController.getAccounts()
       this.preferencesController.setAddresses(accounts)
       this.selectFirstIdentity()
       releaseLock()
@@ -489,6 +511,30 @@ module.exports = class MetamaskController extends EventEmitter {
       releaseLock()
       throw err
     }
+  }
+
+  /**
+   * Get an account balance from the AccountTracker or request it directly from the network.
+   * @param {string} address - The account address
+   * @param {EthQuery} ethQuery - The EthQuery instance to use when asking the network
+   */
+  getBalance (address, ethQuery) {
+    return new Promise((resolve, reject) => {
+      const cached = this.accountTracker.store.getState().accounts[address]
+
+      if (cached && cached.balance) {
+        resolve(cached.balance)
+      } else {
+        ethQuery.getBalance(address, (error, balance) => {
+          if (error) {
+            reject(error)
+            log.error(error)
+          } else {
+            resolve(balance || '0x0')
+          }
+        })
+      }
+    })
   }
 
   /*
@@ -534,45 +580,57 @@ module.exports = class MetamaskController extends EventEmitter {
   // Hardware
   //
 
+  async getKeyringForDevice (deviceName, hdPath = null) {
+    let keyringName = null
+    switch (deviceName) {
+      case 'trezor':
+        keyringName = TrezorKeyring.type
+        break
+      case 'ledger':
+        keyringName = LedgerBridgeKeyring.type
+        break
+      default:
+        throw new Error('MetamaskController:getKeyringForDevice - Unknown device')
+    }
+    let keyring = await this.keyringController.getKeyringsByType(keyringName)[0]
+    if (!keyring) {
+      keyring = await this.keyringController.addNewKeyring(keyringName)
+    }
+    if (hdPath && keyring.setHdPath) {
+      keyring.setHdPath(hdPath)
+    }
+
+    keyring.network = this.networkController.getProviderConfig().type
+
+    return keyring
+
+  }
+
   /**
    * Fetch account list from a trezor device.
    *
    * @returns [] accounts
    */
-  async connectHardware (deviceName, page) {
-
-    switch (deviceName) {
-      case 'trezor':
-        const keyringController = this.keyringController
-        const oldAccounts = await keyringController.getAccounts()
-        let keyring = await keyringController.getKeyringsByType(
-          'Trezor Hardware'
-        )[0]
-        if (!keyring) {
-          keyring = await this.keyringController.addNewKeyring('Trezor Hardware')
-        }
-        let accounts = []
-
-        switch (page) {
-            case -1:
-              accounts = await keyring.getPreviousPage()
-              break
-            case 1:
-              accounts = await keyring.getNextPage()
-              break
-            default:
-              accounts = await keyring.getFirstPage()
-        }
-
-        // Merge with existing accounts
-        // and make sure addresses are not repeated
-        const accountsToTrack = [...new Set(oldAccounts.concat(accounts.map(a => a.address.toLowerCase())))]
-        this.accountTracker.syncWithAddresses(accountsToTrack)
-        return accounts
-
-      default:
-        throw new Error('MetamaskController:connectHardware - Unknown device')
+  async connectHardware (deviceName, page, hdPath) {
+    const keyring = await this.getKeyringForDevice(deviceName, hdPath)
+    let accounts = []
+    switch (page) {
+        case -1:
+          accounts = await keyring.getPreviousPage()
+          break
+        case 1:
+          accounts = await keyring.getNextPage()
+          break
+        default:
+          accounts = await keyring.getFirstPage()
     }
+
+    // Merge with existing accounts
+    // and make sure addresses are not repeated
+    const oldAccounts = await this.keyringController.getAccounts()
+    const accountsToTrack = [...new Set(oldAccounts.concat(accounts.map(a => a.address.toLowerCase())))]
+    this.accountTracker.syncWithAddresses(accountsToTrack)
+    return accounts
   }
 
   /**
@@ -580,21 +638,9 @@ module.exports = class MetamaskController extends EventEmitter {
    *
    * @returns {Promise<boolean>}
    */
-  async checkHardwareStatus (deviceName) {
-
-    switch (deviceName) {
-      case 'trezor':
-        const keyringController = this.keyringController
-        const keyring = await keyringController.getKeyringsByType(
-          'Trezor Hardware'
-        )[0]
-        if (!keyring) {
-          return false
-        }
-        return keyring.isUnlocked()
-      default:
-        throw new Error('MetamaskController:checkHardwareStatus - Unknown device')
-    }
+  async checkHardwareStatus (deviceName, hdPath) {
+    const keyring = await this.getKeyringForDevice(deviceName, hdPath)
+    return keyring.isUnlocked()
   }
 
   /**
@@ -604,20 +650,9 @@ module.exports = class MetamaskController extends EventEmitter {
    */
   async forgetDevice (deviceName) {
 
-    switch (deviceName) {
-      case 'trezor':
-        const keyringController = this.keyringController
-        const keyring = await keyringController.getKeyringsByType(
-          'Trezor Hardware'
-        )[0]
-        if (!keyring) {
-          throw new Error('MetamaskController:forgetDevice - Trezor Hardware keyring not found')
-        }
-        keyring.forgetDevice()
-        return true
-      default:
-        throw new Error('MetamaskController:forgetDevice - Unknown device')
-    }
+    const keyring = await this.getKeyringForDevice(deviceName)
+    keyring.forgetDevice()
+    return true
   }
 
   /**
@@ -625,23 +660,17 @@ module.exports = class MetamaskController extends EventEmitter {
    *
    * @returns {} keyState
    */
-  async unlockTrezorAccount (index) {
-    const keyringController = this.keyringController
-    const keyring = await keyringController.getKeyringsByType(
-      'Trezor Hardware'
-    )[0]
-    if (!keyring) {
-      throw new Error('MetamaskController - No Trezor Hardware Keyring found')
-    }
+  async unlockHardwareWalletAccount (index, deviceName, hdPath) {
+    const keyring = await this.getKeyringForDevice(deviceName, hdPath)
 
     keyring.setAccountToUnlock(index)
-    const oldAccounts = await keyringController.getAccounts()
-    const keyState = await keyringController.addNewAccount(keyring)
-    const newAccounts = await keyringController.getAccounts()
+    const oldAccounts = await this.keyringController.getAccounts()
+    const keyState = await this.keyringController.addNewAccount(keyring)
+    const newAccounts = await this.keyringController.getAccounts()
     this.preferencesController.setAddresses(newAccounts)
     newAccounts.forEach(address => {
       if (!oldAccounts.includes(address)) {
-        this.preferencesController.setAccountLabel(address, `TREZOR #${parseInt(index, 10) + 1}`)
+        this.preferencesController.setAccountLabel(address, `${deviceName.toUpperCase()} ${parseInt(index, 10) + 1}`)
         this.preferencesController.setSelectedAddress(address)
       }
     })
@@ -1302,10 +1331,13 @@ module.exports = class MetamaskController extends EventEmitter {
    * @param {Function} cb - A callback function returning currency info.
    */
   setCurrentCurrency (currencyCode, cb) {
+    const { ticker } = this.networkController.getNetworkConfig()
     try {
+      this.currencyController.setFromCurrency(ticker)
       this.currencyController.setCurrentCurrency(currencyCode)
       this.currencyController.updateConversionRate()
       const data = {
+        fromCurrency: ticker || 'ETH',
         conversionRate: this.currencyController.getConversionRate(),
         currentCurrency: this.currencyController.getCurrentCurrency(),
         conversionDate: this.currencyController.getConversionDate(),
@@ -1326,7 +1358,8 @@ module.exports = class MetamaskController extends EventEmitter {
   buyEth (address, amount) {
     if (!amount) amount = '5'
     const network = this.networkController.getNetworkState()
-    const url = getBuyEthUrl({ network, address, amount })
+    const link = this.networkController.getNetworkConfig().buyUrl
+    const url = getBuyEthUrl({ network, address, amount, link })
     if (url) this.platform.openWindow({ url })
   }
 
@@ -1346,9 +1379,9 @@ module.exports = class MetamaskController extends EventEmitter {
    * @param {string} rpcTarget - A URL for a valid Ethereum RPC API.
    * @returns {Promise<String>} - The RPC Target URL confirmed.
    */
-  async setCustomRpc (rpcTarget) {
-    this.networkController.setRpcTarget(rpcTarget)
-    await this.preferencesController.updateFrequentRpcList(rpcTarget)
+  async setCustomRpc (rpcTarget, chainId) {
+    this.networkController.setRpcTarget(rpcTarget, chainId)
+    await this.preferencesController.updateFrequentRpcList(rpcTarget, chainId)
     return rpcTarget
   }
 
